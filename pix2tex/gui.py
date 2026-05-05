@@ -121,13 +121,41 @@ class App(QMainWindow):
     def startHotkeyListener(self):
         """启动全局热键监听线程"""
         def hotkey_listener():
-            def on_activate():
-                hotkey_queue.put(('snip', None))
+            pressed_keys = set()
+
+            def on_press(key):
+                try:
+                    if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                        pressed_keys.add('alt')
+                    elif hasattr(key, 'char') and key.char == 's':
+                        pressed_keys.add('s')
+                    elif hasattr(key, 'vk') and key.vk == ord('S'):
+                        pressed_keys.add('s')
+                    elif key == keyboard.Key.esc:
+                        pressed_keys.add('esc')
+
+                    if 'alt' in pressed_keys and 's' in pressed_keys:
+                        hotkey_queue.put(('snip', None))
+                    if 'esc' in pressed_keys and self.snipWidget.isSnipping:
+                        hotkey_queue.put(('cancel_snip', None))
+                except Exception as e:
+                    print(f"Hotkey press error: {e}")
+
+            def on_release(key):
+                try:
+                    if key == keyboard.Key.alt_l or key == keyboard.Key.alt_r:
+                        pressed_keys.discard('alt')
+                    elif hasattr(key, 'char') and key.char == 's':
+                        pressed_keys.discard('s')
+                    elif hasattr(key, 'vk') and key.vk == ord('S'):
+                        pressed_keys.discard('s')
+                    elif key == keyboard.Key.esc:
+                        pressed_keys.discard('esc')
+                except Exception as e:
+                    print(f"Hotkey release error: {e}")
 
             try:
-                # 使用 pynput 监听全局热键
-                h = keyboard.HotKey(keyboard.HotKey.parse('<alt>+s'), on_activate)
-                with keyboard.Listener(on_press=lambda key: h.press(key), on_release=lambda key: h.release(key)) as listener:
+                with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
                     listener.join()
             except Exception as e:
                 print(f"Hotkey listener error: {e}")
@@ -146,8 +174,15 @@ class App(QMainWindow):
                 msg = hotkey_queue.get_nowait()
                 if msg[0] == 'snip':
                     self.onSnipHotkey()
+                elif msg[0] == 'cancel_snip':
+                    self.cancelSnip()
         except queue.Empty:
             pass
+
+    def cancelSnip(self):
+        """取消当前截图"""
+        if self.snipWidget.isSnipping:
+            self.snipWidget.cancelSnip()
 
     def onSnipHotkey(self):
         """热键触发的截图"""
@@ -579,6 +614,14 @@ class SnipWidget(QMainWindow):
         QApplication.setOverrideCursor(QtGui.QCursor(QtCore.Qt.CursorShape.CrossCursor))
 
         self.show()
+
+    def cancelSnip(self):
+        """取消截图（由全局热键调用）"""
+        if self.isSnipping:
+            self.isSnipping = False
+            QApplication.restoreOverrideCursor()
+            self.close()
+            self.parent.show()
 
     def paintEvent(self, event):
         if self.isSnipping:
