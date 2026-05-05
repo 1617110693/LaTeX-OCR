@@ -5,13 +5,17 @@ import sys
 import os
 import re
 import tempfile
+import threading
+import queue
 from PyQt6 import QtCore, QtGui
 from PyQt6.QtCore import Qt, pyqtSlot, pyqtSignal, QThread, QTimer, QEvent
-from PyQt6.QtGui import QGuiApplication
+from PyQt6.QtGui import QGuiApplication, QAction
 from PyQt6.QtWebEngineWidgets import QWebEngineView
 from PyQt6.QtWidgets import QMainWindow, QApplication, QMessageBox, QVBoxLayout, QWidget, \
-    QPushButton, QTextEdit, QFormLayout, QHBoxLayout, QDoubleSpinBox, QLabel, QRadioButton
+    QPushButton, QTextEdit, QFormLayout, QHBoxLayout, QDoubleSpinBox, QLabel, QRadioButton, \
+    QSystemTrayIcon, QMenu
 from pynput.mouse import Controller
+from pynput import keyboard
 
 from PIL import ImageGrab, Image, ImageEnhance
 import numpy as np
@@ -21,6 +25,9 @@ from pix2tex.utils import in_model_path
 from latex2sympy2 import latex2sympy
 
 import pix2tex.resources.resources
+
+# 全局热键监听线程
+hotkey_queue = queue.Queue()
 
 ACCEPTED_IMAGE_SUFFIX = ['png', 'jpg', 'jpeg']
 
@@ -52,10 +59,117 @@ class App(QMainWindow):
     def __init__(self, args=None):
         super().__init__()
         self.args = args
-        self.model = cli.LatexOCR(self.args)
+        self.model = None
+        self.model_loaded = False
+        self.tray_icon = None
+        self.hotkey_thread = None
+        self.running = True
         self.initUI()
+        self.initTray()
         self.snipWidget = SnipWidget(self)
         self.show()
+        # 窗口显示后异步加载模型，避免启动时卡顿
+        QTimer.singleShot(100, self.load_model)
+        # 启动全局热键监听线程
+        self.startHotkeyListener()
+
+    def initTray(self):
+        """初始化系统托盘"""
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QtGui.QIcon(':/icons/icon.svg'))
+
+        # 创建托盘菜单
+        tray_menu = QMenu()
+        show_action = QAction("显示窗口", self)
+        show_action.triggered.connect(self.showFromTray)
+        quit_action = QAction("完全退出", self)
+        quit_action.triggered.connect(self.quitApp)
+        tray_menu.addAction(show_action)
+        tray_menu.addAction(quit_action)
+
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.onTrayActivated)
+        self.tray_icon.show()
+
+    def onTrayActivated(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.showFromTray()
+
+    def showFromTray(self):
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def quitApp(self):
+        """完全退出应用"""
+        self.running = False
+        if self.tray_icon:
+            self.tray_icon.hide()
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        """关闭窗口时最小化到托盘"""
+        if self.running:
+            event.ignore()
+            self.hide()
+        else:
+            event.accept()
+
+    def startHotkeyListener(self):
+        """启动全局热键监听线程"""
+        def hotkey_listener():
+            def on_activate():
+                hotkey_queue.put(('snip', None))
+
+            try:
+                # 使用 pynput 监听全局热键
+                h = keyboard.HotKey(keyboard.HotKey.parse('<alt>+s'), on_activate)
+                with keyboard.Listener(on_press=lambda key: h.press(key), on_release=lambda key: h.release(key)) as listener:
+                    listener.join()
+            except Exception as e:
+                print(f"Hotkey listener error: {e}")
+
+        self.hotkey_thread = threading.Thread(target=hotkey_listener, daemon=True)
+        self.hotkey_thread.start()
+        # 定期检查热键队列
+        self.hotkey_timer = QTimer(self)
+        self.hotkey_timer.timeout.connect(self.checkHotkeyQueue)
+        self.hotkey_timer.start(100)
+
+    def checkHotkeyQueue(self):
+        """检查热键队列"""
+        try:
+            while True:
+                msg = hotkey_queue.get_nowait()
+                if msg[0] == 'snip':
+                    self.onSnipHotkey()
+        except queue.Empty:
+            pass
+
+    def onSnipHotkey(self):
+        """热键触发的截图"""
+        # 如果窗口隐藏，先显示
+        if not self.isVisible():
+            self.showFromTray()
+        # 使用现有的截图逻辑
+        self.onClick()
+
+    def load_model(self):
+        """异步加载模型"""
+        self.toggleProcessing(True)
+        try:
+            self.model = cli.LatexOCR(self.args)
+            self.model_loaded = True
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.webView.setHtml("<html><body><center><h2 style='color:red'>模型加载失败</h2></center></body></html>")
+            QMessageBox.critical(self, "错误", f"模型加载失败: {e}")
+        finally:
+            self.toggleProcessing(False)
 
     def initUI(self):
         self.setWindowTitle("LaTeX OCR")
@@ -129,6 +243,10 @@ class App(QMainWindow):
         self.retryButton.setEnabled(False)
         self.retryButton.clicked.connect(self.returnSnip)
 
+        # Create copy button
+        self.copyButton = QPushButton('Copy to Clipboard', self)
+        self.copyButton.clicked.connect(self.copyToClipboard)
+
         # Create layout
         centralWidget = QWidget()
         centralWidget.setMinimumWidth(200)
@@ -144,6 +262,7 @@ class App(QMainWindow):
         buttons.addWidget(self.snipButton)
         buttons.addWidget(self.retryButton)
         lay.addLayout(buttons)
+        lay.addWidget(self.copyButton)  # 长长的复制按钮
         settings = QFormLayout()
         settings.addRow('Temperature:', self.tempField)
         lay.addLayout(settings)
@@ -256,6 +375,10 @@ class App(QMainWindow):
             return self.returnSnip(Image.open(image_path))
 
     def returnSnip(self, img=None):
+        if not self.model_loaded:
+            QMessageBox.warning(self, "提示", "模型正在加载中，请稍候...")
+            return
+
         self.toggleProcessing(True)
         self.retryButton.setEnabled(False)
 
@@ -355,6 +478,15 @@ class App(QMainWindow):
         text = self.format_textbox.toPlainText()
         clipboard = QApplication.clipboard()
         clipboard.setText(text)
+
+    def copyToClipboard(self):
+        """复制 LaTeX 代码到剪贴板"""
+        text = self.format_textbox.toPlainText()
+        clipboard = QApplication.clipboard()
+        clipboard.setText(text)
+        # 显示短暂提示
+        self.copyButton.setText("Copied!")
+        QTimer.singleShot(1500, lambda: self.copyButton.setText("Copy to Clipboard"))
 
     def displayPrediction(self, prediction=None):
         if self.isProcessing:
